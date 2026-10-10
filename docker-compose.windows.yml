@@ -1,0 +1,38 @@
+# DSN-Agent für Windows mit Docker Desktop (Linux-Container-Modus).
+#
+# Schnellstart (PowerShell im DSN-Ordner):
+#   docker compose -f docker-compose.windows.yml up -d ; docker logs dsn
+# -> Pairing-Token aus dem Log im Dashboard einfügen und dort die IP dieses PCs angeben.
+# Firewall: TCP 7946 und 8873 für private Netze freigeben (install.ps1 macht das automatisch).
+#
+# Unterschiede zu Linux: kein Host-Netz -> Ports werden veröffentlicht; Daten + Konfiguration liegen im
+# Docker-Volume "dsn-data" (Linux-Dateisystem in der Docker-Desktop-VM, daher auch für Datenbanken geeignet).
+services:
+  dsn:
+    image: ${DSN_IMAGE:-ghcr.io/themagix9/dsn:latest}
+    container_name: dsn
+    restart: unless-stopped
+    labels:
+      dsn.agent: "true"
+    ports:
+      - "7946:7946"
+      - "8873:8873"
+    environment:
+      DSN_PLATFORM: windows
+      DSN_HOSTNAME: ${COMPUTERNAME:-windows}
+      DSN_DATA_DIR: /var/lib/docker/volumes/dsn-data/_data
+      DSN_CONFIG: /var/lib/docker/volumes/dsn-data/_data/config.yml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # gleicher Pfad wie in der VM, damit Compose-Bind-Mounts von ${DSN_DATA} funktionieren
+      - dsn-data:/var/lib/docker/volumes/dsn-data/_data
+      # nur lesend: zum Übernehmen bestehender Container (Volumes + Windows-Ordner) und für Disk-Metriken
+      - /var/lib/docker/volumes:/host/var/lib/docker/volumes:ro
+      - /run/desktop/mnt/host:/host/run/desktop/mnt/host:ro
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  dsn-data:
+    name: dsn-data

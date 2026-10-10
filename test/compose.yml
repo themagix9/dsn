@@ -1,0 +1,53 @@
+# Lokaler 3-Node-Testcluster: jeder Node hat einen eigenen Docker-Daemon (dind)
+name: dsn-test
+networks:
+  dsn:
+    ipam: { config: [{ subnet: 172.30.0.0/24 }] }
+x-dind: &dind
+  image: docker:27.5-dind
+  privileged: true
+  environment: { DOCKER_TLS_CERTDIR: "" }
+x-agent: &agent
+  image: dsn:test
+  environment: { DSN_LOG: INFO }
+services:
+  d1:
+    <<: *dind
+    volumes: [n1data:/srv/dsn, n1lib:/var/lib/dsn]
+    networks: { dsn: { ipv4_address: 172.30.0.21 } }
+  node1:
+    <<: *agent
+    environment: { DOCKER_HOST: "tcp://172.30.0.21:2375", DSN_LOG: INFO, DSN_CONFIG: /etc/dsn-test/n1.yml }
+    volumes: [n1data:/srv/dsn, n1lib:/var/lib/dsn]
+    networks: { dsn: { ipv4_address: 172.30.0.11 } }
+    ports: ["17941:7946"]
+    depends_on: [d1]
+  d2:
+    <<: *dind
+    volumes: [n2data:/srv/dsn, n2lib:/var/lib/dsn]
+    networks: { dsn: { ipv4_address: 172.30.0.22 } }
+  node2:
+    <<: *agent
+    environment: { DOCKER_HOST: "tcp://172.30.0.22:2375", DSN_LOG: INFO, DSN_CONFIG: /etc/dsn-test/n2.yml }
+    volumes: [n2data:/srv/dsn, n2lib:/var/lib/dsn]
+    networks: { dsn: { ipv4_address: 172.30.0.12 } }
+    ports: ["17942:7946"]
+    depends_on: [d2]
+  d3:
+    <<: *dind
+    volumes: [n3data:/srv/dsn, n3lib:/var/lib/dsn]
+    networks: { dsn: { ipv4_address: 172.30.0.23 } }
+  node3:
+    <<: *agent
+    environment: { DOCKER_HOST: "tcp://172.30.0.23:2375", DSN_LOG: INFO, DSN_CONFIG: /etc/dsn-test/n3.yml }
+    volumes: [n3data:/srv/dsn, n3lib:/var/lib/dsn]
+    networks: { dsn: { ipv4_address: 172.30.0.13 } }
+    ports: ["17943:7946"]
+    depends_on: [d3]
+volumes:
+  n1data: {}
+  n1lib: {}
+  n2data: {}
+  n2lib: {}
+  n3data: {}
+  n3lib: {}

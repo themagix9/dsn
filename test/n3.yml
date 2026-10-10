@@ -1,0 +1,13 @@
+node:
+  name: node3
+  address: 172.30.0.13
+  public_ip: "203.0.113.3"
+  role: worker
+  leader_priority: 30
+  labels: {test: "yes"}
+cluster:
+  secret: "test-secret-0123456789-abcdefghijkl"
+  seeds: ["172.30.0.11:7946"]
+port: 7946
+disks:
+  - { name: root, path: / }

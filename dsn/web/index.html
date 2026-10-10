@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deep Space Network</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232a78d6' d='M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 4a6 6 0 1 1 0 12 6 6 0 0 1 0-12Zm0 4a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="vendor/vue.global.prod.js"></script>
+  <script src="vendor/qrcode.js"></script>
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <link rel="stylesheet" href="vendor/xterm.css">
+</head>
+<body>
+<div id="app" v-cloak>
+
+  <!-- ================================================= Login / Setup -->
+  <div v-if="view === 'login' || view === 'setup'" class="login-wrap">
+    <form class="card login" @submit.prevent="view === 'setup' ? doSetup() : doLogin()">
+      <div class="brand"><dsn-logo></dsn-logo> Deep Space Network</div>
+      <template v-if="view === 'setup'">
+        <p class="sub" style="margin:0">Erster Start: Admin-Konto anlegen. Zur Bestätigung brauchst du das
+          <b>Cluster-Secret</b> aus <code>/etc/dsn/config.yml</code>.</p>
+        <label class="field">Cluster-Secret<input type="password" v-model="loginForm.token" autocomplete="off" required></label>
+      </template>
+      <label class="field">Benutzername<input type="text" v-model="loginForm.username" autocomplete="username" required></label>
+      <label class="field">Passwort<input type="password" v-model="loginForm.password" :autocomplete="view === 'setup' ? 'new-password' : 'current-password'" required></label>
+      <label class="field" v-if="loginForm.needTotp">2FA-Code<input type="text" v-model="loginForm.totp" inputmode="numeric" autocomplete="one-time-code" ref="totpInput"></label>
+      <div class="error-box" v-if="loginForm.error">{{ loginForm.error }}</div>
+      <button class="btn primary" type="submit" :disabled="busy">{{ view === 'setup' ? 'Admin anlegen' : 'Anmelden' }}</button>
+      <p class="hint" style="text-align:center">Node: {{ setupNode }}</p>
+    </form>
+  </div>
+
+  <!-- ================================================= App -->
+  <template v-else-if="view === 'app'">
+    <div class="banner critical" v-if="ov && ov.cluster.fenced">
+      ⛔ Dieser Node ({{ ov.cluster.me }}) hat kein Quorum und hat seine Services gestoppt (Self-Fencing). Die Anzeige ist evtl. veraltet.
+    </div>
+    <div class="banner warning" v-else-if="ov && !ov.cluster.has_quorum">
+      ⚠️ Kein Quorum: {{ ov.cluster.alive }}/{{ ov.cluster.members }} Nodes erreichbar, {{ ov.cluster.quorum }} nötig. Es finden keine Failover statt.
+    </div>
+    <div class="banner warning" v-if="!wsOk">⚠️ Verbindung zum Node unterbrochen – verbinde neu …</div>
+
+    <header class="topbar">
+      <div class="brand"><dsn-logo></dsn-logo> Deep Space Network <small v-if="ov">v{{ ov.cluster.dsn_version }}</small></div>
+      <nav class="tabs">
+        <button v-for="t in tabs" :key="t.id" :class="{active: tab === t.id}" @click="tab = t.id">{{ t.label }}</button>
+      </nav>
+      <div class="spacer"></div>
+      <span class="pill" :class="ov && ov.cluster.has_quorum ? 'good' : 'critical'" v-if="ov">
+        <span class="dot"></span>Quorum {{ ov.cluster.alive }}/{{ ov.cluster.members }}
+      </span>
+      <span class="sub" v-if="ov">Leader: <b>{{ ov.cluster.leader || '–' }}</b> · verbunden mit {{ ov.cluster.me }}</span>
+      <button class="btn sm" @click="toggleTheme" :title="'Design: ' + theme">{{ theme === 'dark' ? '☾' : theme === 'light' ? '☀' : '◐' }}</button>
+      <button class="btn sm" @click="logout">Abmelden ({{ me.username }})</button>
+    </header>
+
+    <main v-if="ov">
+      <!-- ============================================= Übersicht -->
+      <section v-if="tab === 'overview'">
+        <div class="grid kpis">
+          <div class="card kpi">
+            <div class="label">Nodes online</div>
+            <div class="value">{{ ov.nodes.filter(n => n.online).length }} <small>/ {{ ov.nodes.length }}</small></div>
+            <div class="foot"><span class="pill" :class="ov.cluster.has_quorum ? 'good' : 'critical'"><span class="dot"></span>{{ ov.cluster.has_quorum ? 'Quorum vorhanden' : 'Kein Quorum' }}</span></div>
+          </div>
+          <div class="card kpi">
+            <div class="label">Services laufen</div>
+            <div class="value">{{ runningServices }} <small>/ {{ ov.services.filter(s => s.enabled).length }}</small></div>
+            <div class="foot"><span class="pill" :class="problemServices.length ? 'warning' : 'good'"><span class="dot"></span>{{ problemServices.length ? problemServices.length + ' mit Problemen' : 'Alles in Ordnung' }}</span></div>
+          </div>
+          <div class="card kpi">
+            <div class="label">Leader</div>
+            <div class="value" style="font-size:22px">{{ ov.cluster.leader || '–' }}</div>
+            <div class="foot sub">Term {{ ov.cluster.term }} · State v{{ ov.cluster.version }}</div>
+          </div>
+          <div class="card kpi">
+            <div class="label">Warnungen (24 h)</div>
+            <div class="value">{{ recentProblems }}</div>
+            <div class="foot sub">Warnungen und kritische Ereignisse</div>
+          </div>
+        </div>
+
+        <div class="section-head"><h2>Nodes</h2><span class="sub">Live, alle 2 s aktualisiert</span></div>
+        <div class="grid nodes-grid">
+          <div v-for="n in ov.nodes" :key="n.name" class="card node-card" :class="{offline: !n.online}">
+            <div class="node-head">
+              <div style="flex:1">
+                <div class="name">{{ n.name }}
+                  <span class="badge leader" v-if="n.is_leader">Leader</span>
+                  <span class="badge" v-if="n.role === 'witness'">Witness</span>
+                  <span class="badge" v-if="n.platform === 'windows'">Windows</span>
+                  <span class="badge" v-if="n.is_me">dieser Node</span>
+                </div>
+                <div class="meta mono">{{ n.address }}<template v-if="n.public_ip"> · {{ n.public_ip }}</template></div>
+              </div>
+              <node-status :n="n"></node-status>
+            </div>
+            <template v-if="n.online && n.metrics.cpu !== undefined">
+              <div>
+                <div class="meter"><span class="lbl">CPU</span><div class="track"><div class="fill" :class="level(n.metrics.cpu, 95, 80)" :style="{width: n.metrics.cpu + '%'}"></div></div><span class="val">{{ n.metrics.cpu.toFixed(0) }} %</span></div>
+                <div class="meter"><span class="lbl">RAM</span><div class="track"><div class="fill" :class="level(n.metrics.mem_percent, 95, 85)" :style="{width: n.metrics.mem_percent + '%'}"></div></div><span class="val">{{ n.metrics.mem_percent.toFixed(0) }} %</span></div>
+                <div class="meter" v-for="d in n.metrics.disks" :key="d.name" :title="d.path + (d.error ? ' – ' + d.error : ' – ' + bytes(d.used) + ' von ' + bytes(d.total))">
+                  <span class="lbl">{{ d.name }}</span>
+                  <div class="track"><div class="fill" :class="level(d.percent || 0, 90, 80)" :style="{width: (d.percent || 0) + '%'}"></div></div>
+                  <span class="val">{{ d.error ? '–' : d.percent.toFixed(0) + ' %' }}</span>
+                </div>
+              </div>
+              <div class="facts">
+                <div><span>RAM</span>{{ bytes(n.metrics.mem_used) }} / {{ bytes(n.metrics.mem_total) }}</div>
+                <div><span>Latenz</span>{{ n.is_me ? 'lokal' : (n.rtt_ms != null ? n.rtt_ms + ' ms' : '–') }}</div>
+                <div><span>Load</span>{{ n.metrics.load.map(x => x.toFixed(1)).join(' ') }}</div>
+                <div><span>Netz ↓/↑</span>{{ bytes(n.metrics.net_rx) }}/s · {{ bytes(n.metrics.net_tx) }}/s</div>
+                <div><span>Uptime</span>{{ duration(Date.now() / 1000 - n.metrics.boot_time) }}</div>
+                <div><span>Temp</span>{{ maxTemp(n.metrics.temps) }}</div>
+              </div>
+              <div class="checks" v-if="n.metrics.hostchecks && n.metrics.hostchecks.length">
+                <span v-for="c in n.metrics.hostchecks" :key="c.name">
+                  <span class="pill" :class="c.status === 'ok' ? 'good' : c.status === 'critical' ? 'critical' : 'warning'"><span class="dot"></span>{{ c.name }}</span>
+                  <span class="sub"> {{ c.summary }}</span>
+                </span>
+              </div>
+            </template>
+            <div v-else class="sub">{{ n.online ? 'Warte auf Metriken …' : 'Keine Heartbeats seit ' + duration(n.down_for) + (n.error ? ' – ' + n.error : '') }}</div>
+            <div class="chips" v-if="n.services.length">
+              <span class="badge" v-for="s in n.services" :key="s">{{ s }}</span>
+            </div>
+            <div><button class="btn sm" @click="openNode(n.name)">Verlauf &amp; Details</button></div>
+          </div>
+        </div>
+
+        <div class="section-head"><h2>Letzte Ereignisse</h2><button class="btn sm" @click="tab = 'events'">Alle anzeigen</button></div>
+        <div class="card"><event-list :events="ov.events.slice(0, 12)"></event-list></div>
+      </section>
+
+      <!-- ============================================= Services -->
+      <section v-if="tab === 'services'">
+        <div class="section-head">
+          <h2>Services</h2><span class="sub">Jeder Service ist ein Compose-Stack, der als Ganzes umzieht</span>
+          <div class="spacer"></div>
+          <button class="btn primary" v-if="isAdmin" @click="editService(null)">+ Neuer Service</button>
+        </div>
+        <div class="card table-wrap">
+          <table v-if="ov.services.length">
+            <thead><tr><th>Service</th><th>Status</th><th>Node</th><th>Datensync</th><th>DNS</th><th></th></tr></thead>
+            <tbody>
+              <tr v-for="s in ov.services" :key="s.name">
+                <td><b>{{ s.name }}</b><span class="sub">{{ s.description }}</span>
+                  <span class="sub" v-if="s.containers.length">{{ s.containers.length }} Container</span></td>
+                <td>
+                  <svc-status :s="s"></svc-status>
+                  <span class="sub" v-if="s.error" :title="s.error" style="color:var(--critical)">Fehler beim Start – siehe Logs</span>
+                </td>
+                <td>
+                  <b>{{ s.node || '–' }}</b><span v-if="s.phase === 'migrating'"> → {{ s.target }}</span>
+                  <span class="sub" v-if="s.since">seit {{ ago(s.since) }}<template v-if="s.reason"> · {{ s.reason }}</template></span>
+                  <span class="sub" v-if="s.placement.preferred.length">bevorzugt: {{ s.placement.preferred.join(' → ') }}</span>
+                </td>
+                <td>
+                  <template v-if="s.sync.mode === 'none'"><span class="sub">kein Sync</span></template>
+                  <template v-else>
+                    <span class="pill" :class="s.sync.fail_count >= 3 ? 'critical' : s.sync.fail_count ? 'warning' : s.sync.last_ok ? 'good' : ''"><span class="dot"></span>{{ s.sync.mode === 'dump' ? 'Dump + rsync' : 'rsync' }} / {{ duration(s.sync.interval) }}</span>
+                    <span class="sub">letzter Erfolg: {{ s.sync.last_ok ? ago(s.sync.last_ok) : 'noch nie' }}</span>
+                    <span class="sub" v-if="s.sync.last_error" style="color:var(--critical)" :title="s.sync.last_error">{{ s.sync.last_error.slice(0, 80) }}</span>
+                  </template>
+                </td>
+                <td>
+                  <span v-for="d in s.dns" :key="d.name" class="sub mono">{{ d.name }}<template v-if="d.proxied"> (proxied)</template></span>
+                  <span class="sub" v-if="!s.dns.length">–</span>
+                  <span class="sub" v-if="s.dns_error" style="color:var(--critical)">{{ s.dns_error }}</span>
+                </td>
+                <td>
+                  <div class="actions">
+                    <button class="btn sm" @click="showLogs(s.name)" :disabled="!s.node">Logs</button>
+                    <template v-if="isAdmin">
+                      <select class="btn sm" style="width:auto" @change="moveService(s.name, $event)" :disabled="s.phase === 'migrating'">
+                        <option value="">Verschieben …</option>
+                        <option v-for="n in workerNodes" :key="n.name" :value="n.name" :disabled="n.name === s.node || !n.online">{{ n.name }}</option>
+                      </select>
+                      <button class="btn sm" @click="serviceAction(s.name, 'restart')">Neustart</button>
+                      <button class="btn sm" @click="serviceAction(s.name, 'pull')" title="Images neu ziehen und Stack neu erstellen">Update</button>
+                      <button class="btn sm" v-if="s.sync.mode !== 'none'" @click="serviceAction(s.name, 'sync')">Sync jetzt</button>
+                      <button class="btn sm" @click="editService(s.name)">Bearbeiten</button>
+                    </template>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="empty">Noch keine Services. Leg mit „+ Neuer Service“ den ersten Compose-Stack an.</div>
+        </div>
+      </section>
+
+      <!-- ============================================= Docker (Verwaltung + HA-Übernahme) -->
+      <section v-if="tab === 'containers'">
+        <div class="section-head">
+          <h2>Docker</h2>
+          <div class="chips">
+            <button class="btn sm" v-for="n in workerNodes" :key="n.name" :class="{primary: inv.node === n.name}"
+                    :disabled="!n.online" @click="loadInventory(n.name)">{{ n.name }}<template v-if="n.platform === 'windows'"> (Win)</template></button>
+          </div>
+          <div class="spacer"></div>
+          <template v-if="inv.node && isAdmin">
+            <button class="btn sm" @click="openStack(null)">+ Neuer Stack</button>
+            <button class="btn sm primary" v-if="unprotectedItems.length" @click="openBulk">Ganzen Server schützen ({{ unprotectedItems.length }})</button>
+          </template>
+        </div>
+        <div v-if="!inv.node" class="card empty">Wähle oben einen Server.</div>
+        <template v-else>
+          <div class="card" v-if="nodeById(inv.node) && nodeById(inv.node).unprotected.length" style="margin-bottom:14px; border-color: var(--warning)">
+            ⚠️ <b>{{ nodeById(inv.node).unprotected.length }} laufende Container auf {{ inv.node }} sind nicht HA-geschützt</b>.
+            Fällt der Server aus, laufen sie nirgendwo weiter.
+            <span class="sub" v-if="nodeById(inv.node).protect_all">Der Server ist als „vollständig geschützt“ markiert, neue Container werden gemeldet.</span>
+          </div>
+          <div class="tabs" style="margin-bottom:12px">
+            <button v-for="t in dockerTabs" :key="t.id" :class="{active: inv.sub === t.id}" @click="setDockerTab(t.id)">{{ t.label }}</button>
+            <div class="spacer"></div>
+            <button class="btn sm" @click="refreshDocker">Aktualisieren</button>
+          </div>
+          <div v-if="inv.loading" class="card empty">Lade von {{ inv.node }} …</div>
+          <div v-else-if="inv.error" class="error-box">{{ inv.error }}</div>
+
+          <!-- ---------- Container -->
+          <template v-else-if="inv.sub === 'containers' && inv.data">
+            <div class="card table-wrap">
+              <h3>Stacks <span class="sub">(Compose / Portainer / DSN)</span></h3>
+              <table v-if="inv.data.stacks.length">
+                <tbody>
+                  <template v-for="s in inv.data.stacks" :key="s.name">
+                    <tr style="background: var(--surface-2)">
+                      <td colspan="3"><b>{{ s.name }}</b>
+                        <span class="sub" style="display:inline"> · {{ stackKind(s) }}</span></td>
+                      <td><span class="pill" :class="s.state === 'running' ? 'good' : s.state === 'partial' ? 'warning' : ''"><span class="dot"></span>{{ stateLabel(s.state) }}</span></td>
+                      <td><div class="actions">
+                        <span v-if="s.agent" class="pill info"><span class="dot"></span>DSN-Agent dieses Servers</span>
+                        <span v-else-if="s.managed" class="pill good"><span class="dot"></span>HA-geschützt ({{ s.dsn_service }})</span>
+                        <span v-else-if="s.adopted_by" class="pill info"><span class="dot"></span>Original von „{{ s.adopted_by }}“</span>
+                        <template v-else-if="isAdmin">
+                          <button class="btn sm" v-if="s.state !== 'running'" @click="stackAction(s.name, 'start')">Start</button>
+                          <button class="btn sm" v-if="s.state !== 'stopped'" @click="stackAction(s.name, 'stop')">Stop</button>
+                          <button class="btn sm" @click="stackAction(s.name, 'restart')">Neustart</button>
+                          <button class="btn sm" v-if="isLocalStack(s)" @click="openStack(s.name)">Bearbeiten</button>
+                          <button class="btn sm danger" @click="stackAction(s.name, 'down')">Entfernen</button>
+                          <button class="btn sm primary" @click="openAdopt(inv.node, 'stack', s.name)">In HA aufnehmen</button>
+                        </template>
+                      </div></td>
+                    </tr>
+                    <tr v-for="c in s.containers" :key="c.id">
+                      <td style="padding-left:24px">{{ c.service || c.name }}<span class="sub mono">{{ c.name }}</span></td>
+                      <td class="mono" style="font-size:12px">{{ c.image }}</td>
+                      <td><span class="sub mono" v-for="p in c.ports" :key="p">{{ p }}</span></td>
+                      <td><span class="pill" :class="c.state === 'running' ? (c.health === 'unhealthy' ? 'warning' : 'good') : ''"><span class="dot"></span>{{ c.state }}<template v-if="c.health"> · {{ c.health }}</template></span></td>
+                      <td><container-actions :c="c" :admin="isAdmin" :locked="s.managed || s.agent" @act="containerAction" @logs="showContainerLogs" @console="openConsole" @inspect="inspectContainer"></container-actions></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <div v-else class="empty">Keine Stacks.</div>
+            </div>
+            <div class="card table-wrap" style="margin-top:14px">
+              <h3>Einzelne Container <span class="sub">(per docker run gestartet)</span></h3>
+              <table v-if="standaloneContainers.length">
+                <tbody>
+                  <tr v-for="c in standaloneContainers" :key="c.id">
+                    <td><b>{{ c.name }}</b><span class="sub mono">{{ c.id }}</span></td>
+                    <td class="mono" style="font-size:12px">{{ c.image }}</td>
+                    <td><span class="sub mono" v-for="p in c.ports" :key="p">{{ p }}</span></td>
+                    <td><span class="pill" :class="c.state === 'running' ? 'good' : ''"><span class="dot"></span>{{ c.state }}</span></td>
+                    <td><div class="actions">
+                      <span v-if="c.adopted_by" class="pill info"><span class="dot"></span>Original von „{{ c.adopted_by }}“</span>
+                      <button v-else-if="isAdmin" class="btn sm primary" @click="openAdopt(inv.node, 'container', c.name)">In HA aufnehmen</button>
+                      <container-actions :c="c" :admin="isAdmin" :locked="false" @act="containerAction" @logs="showContainerLogs" @console="openConsole" @inspect="inspectContainer"></container-actions>
+                    </div></td>
+                  </tr>
+                </tbody>
+              </table>
+              <div v-else class="empty">Keine einzelnen Container.</div>
+            </div>
+          </template>
+
+          <!-- ---------- Images -->
+          <div v-else-if="inv.sub === 'images' && inv.list" class="card table-wrap">
+            <div style="display:flex; gap:8px; margin-bottom:8px" v-if="isAdmin">
+              <button class="btn sm" @click="dockerOp('images.prune', {all: false}, 'Unbenannte Images (dangling) löschen?')">Dangling löschen</button>
+              <button class="btn sm danger" @click="dockerOp('images.prune', {all: true}, 'ALLE ungenutzten Images löschen? Sie müssen bei Bedarf neu geladen werden.')">Alle ungenutzten löschen</button>
+            </div>
+            <table>
+              <thead><tr><th>Image</th><th>Tag</th><th>ID</th><th>Größe</th><th>Erstellt</th><th>Status</th><th></th></tr></thead>
+              <tbody><tr v-for="im in inv.list" :key="im.ID + im.Tag">
+                <td class="mono">{{ im.Repository }}</td><td class="mono">{{ im.Tag }}</td>
+                <td class="mono sub">{{ shortId(im.ID) }}</td>
+                <td class="tnum">{{ im.Size }}</td><td class="sub">{{ im.CreatedSince }}</td>
+                <td><span class="pill" :class="im.in_use ? 'good' : ''"><span class="dot"></span>{{ im.in_use ? 'in Benutzung' : 'ungenutzt' }}</span></td>
+                <td><div class="actions"><button class="btn sm danger" v-if="isAdmin && !im.in_use" @click="removeImage(im)">Löschen</button></div></td>
+              </tr></tbody>
+            </table>
+          </div>
+
+          <!-- ---------- Volumes -->
+          <div v-else-if="inv.sub === 'volumes' && inv.list" class="card table-wrap">
+            <div style="display:flex; gap:8px; margin-bottom:8px" v-if="isAdmin">
+              <button class="btn sm" @click="dockerOp('volumes.prune', {}, 'Ungenutzte anonyme Volumes löschen? Benannte Volumes bleiben erhalten.')">Ungenutzte anonyme löschen</button>
+            </div>
+            <table>
+              <thead><tr><th>Volume</th><th>Treiber</th><th>Status</th><th></th></tr></thead>
+              <tbody><tr v-for="v in inv.list" :key="v.Name">
+                <td class="mono" :title="v.Name">{{ v.Name.length > 40 ? v.Name.slice(0, 12) + '…' : v.Name }}</td><td>{{ v.Driver }}</td>
+                <td><span class="pill" :class="v.in_use ? 'good' : 'warning'"><span class="dot"></span>{{ v.protected ? 'DSN-Daten' : v.in_use ? 'in Benutzung' : 'ungenutzt' }}</span></td>
+                <td><div class="actions"><button class="btn sm danger" v-if="isAdmin && !v.in_use && !v.protected" @click="removeVolume(v)">Löschen</button></div></td>
+              </tr></tbody>
+            </table>
+          </div>
+
+          <!-- ---------- Netzwerke -->
+          <div v-else-if="inv.sub === 'networks' && inv.list" class="card table-wrap">
+            <div style="display:flex; gap:8px; margin-bottom:8px" v-if="isAdmin">
+              <input type="text" v-model="inv.newNet" placeholder="neues-netzwerk" style="max-width:220px">
+              <button class="btn sm" @click="createNetwork" :disabled="!inv.newNet">Anlegen</button>
+              <button class="btn sm" @click="dockerOp('networks.prune', {}, 'Ungenutzte Netzwerke löschen?')">Ungenutzte löschen</button>
+            </div>
+            <table>
+              <thead><tr><th>Netzwerk</th><th>Treiber</th><th>Scope</th><th></th></tr></thead>
+              <tbody><tr v-for="n in inv.list" :key="n.ID">
+                <td class="mono">{{ n.Name }}</td><td>{{ n.Driver }}</td><td>{{ n.Scope }}</td>
+                <td><div class="actions"><button class="btn sm danger" v-if="isAdmin && !n.builtin" @click="removeNetwork(n)">Löschen</button></div></td>
+              </tr></tbody>
+            </table>
+          </div>
+        </template>
+      </section>
+
+      <!-- ============================================= Nodes -->
+      <section v-if="tab === 'nodes'">
+        <div class="section-head">
+          <h2>Nodes</h2>
+          <span class="sub">Quorum: {{ ov.cluster.quorum }} von {{ ov.cluster.members }} Stimmen nötig</span>
+          <div class="spacer"></div>
+          <button class="btn primary" v-if="isAdmin" @click="openJoin">+ Server hinzufügen</button>
+        </div>
+        <div class="card" v-if="ov.cluster.members === 2" style="margin-bottom:14px; border-color: var(--warning)">
+          <b>⚠️ Nur 2 Nodes:</b> Fällt einer aus, hat der andere kein Quorum (1/2), deshalb gibt es <b>kein automatisches Failover</b>.
+          Füge einen dritten Node hinzu (z.B. den DL360) oder einen kleinen <b>Witness</b> (Raspberry Pi, VPS), der nur mitstimmt.
+        </div>
+        <div class="card table-wrap">
+          <table>
+            <thead><tr><th>Node</th><th>Status</th><th>Rolle</th><th>Labels</th><th>Leader-Prio</th><th>Version</th><th></th></tr></thead>
+            <tbody>
+              <tr v-for="n in ov.nodes" :key="n.name">
+                <td><b>{{ n.name }}</b> <span class="badge leader" v-if="n.is_leader">Leader</span>
+                  <span class="sub mono">{{ n.address }}</span><span class="sub mono" v-if="n.public_ip">öffentl.: {{ n.public_ip }}</span></td>
+                <td><node-status :n="n"></node-status>
+                  <span class="sub" v-if="n.online">stabil seit {{ duration(n.stable_for) }}</span></td>
+                <td>{{ n.role === 'witness' ? 'Witness' : 'Worker' }}<span class="sub">{{ n.platform === 'windows' ? 'Windows / Docker Desktop' : 'Linux' }}</span></td>
+                <td><div class="chips"><span class="badge" v-for="(v, k) in n.labels" :key="k">{{ k }}={{ v }}</span></div></td>
+                <td class="tnum">{{ n.leader_priority }}</td>
+                <td class="tnum">{{ n.version || '–' }}<span class="sub mono">{{ n.build }}</span>
+                  <span class="sub" v-if="n.tailscale && n.tailscale.ip">🔒 Tailscale {{ n.tailscale.ip }}</span>
+                  <a class="sub" v-if="n.tailscale && n.tailscale.serving && n.tailscale.dns" :href="'https://' + n.tailscale.dns" target="_blank">https://{{ n.tailscale.dns }}</a>
+                  <span class="sub" v-if="n.tailscale && n.tailscale.error" style="color:var(--critical)" :title="n.tailscale.error">Tailscale-Fehler</span>
+                  <span class="sub" v-if="n.tailscale && n.tailscale.mode === 'app' && n.tailscale.enabled">Tailscale: Windows-App</span></td>
+                <td><div class="actions">
+                  <button class="btn sm" @click="openNode(n.name)">Verlauf</button>
+                  <template v-if="isAdmin">
+                    <button class="btn sm" @click="editNode(n)">Bearbeiten</button>
+                    <button class="btn sm" v-if="n.online" @click="updateNode(n)" title="Neuestes DSN-Image ziehen und Agent neu starten">Update</button>
+                    <button class="btn sm" v-if="n.role !== 'witness'" @click="toggleDrain(n)">{{ n.drain ? 'Drain aufheben' : 'Drain' }}</button>
+                    <button class="btn sm danger" @click="removeNode(n)">Entfernen</button>
+                  </template>
+                </div></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="hint"><b>Drain</b> verschiebt alle Services kontrolliert weg (Stop → finaler Sync → Start am Ziel), z.B. vor Wartungsarbeiten.
+          Ein Node kann erst entfernt werden, wenn keine Services mehr darauf laufen.</p>
+      </section>
+
+      <!-- ============================================= Events -->
+      <section v-if="tab === 'events'">
+        <div class="section-head">
+          <h2>Ereignisse</h2>
+          <div class="spacer"></div>
+          <select v-model="eventFilter" style="width:auto">
+            <option value="">Alle</option><option value="warning">Warnungen + kritisch</option><option value="critical">Nur kritisch</option>
+          </select>
+        </div>
+        <div class="card"><event-list :events="filteredEvents"></event-list></div>
+      </section>
+
+      <!-- ============================================= Einstellungen -->
+      <section v-if="tab === 'settings' && settings">
+        <div class="section-head"><h2>Einstellungen</h2><span class="sub">Gelten clusterweit und werden auf alle Nodes repliziert</span>
+          <div class="spacer"></div>
+          <button class="btn primary" @click="saveSettings" :disabled="busy">Speichern</button></div>
+        <div class="error-box" v-if="settingsMsg.error">{{ settingsMsg.error }}</div>
+        <div class="ok-box" v-if="settingsMsg.ok">{{ settingsMsg.ok }}</div>
+        <div class="grid two-col">
+          <div class="card">
+            <h3>Failover-Zeiten (Sekunden)</h3>
+            <div class="form-grid">
+              <label class="field">Heartbeat-Intervall<input type="number" v-model.number="settings.timeouts.heartbeat"></label>
+              <label class="field">Node-Timeout<input type="number" v-model.number="settings.timeouts.node_timeout"></label>
+              <label class="field">Leader-Lease<input type="number" v-model.number="settings.timeouts.lease"></label>
+              <label class="field">Self-Fencing nach<input type="number" v-model.number="settings.timeouts.fence"></label>
+              <label class="field">Failover nach<input type="number" v-model.number="settings.timeouts.failover"></label>
+              <label class="field">Service-Fehler → anderer Node nach<input type="number" v-model.number="settings.timeouts.service_fail"></label>
+              <label class="field">Failback: Node stabil seit<input type="number" v-model.number="settings.timeouts.failback_delay"></label>
+            </div>
+            <label class="check" style="margin-top:12px"><input type="checkbox" v-model="settings.failback_enabled"> Automatischer Failback auf den bevorzugten Node (Standard für alle Services)</label>
+            <p class="hint">Regel: Node-Timeout &lt; Fencing &lt; Failover. So hat sich ein abgeschnittener Node garantiert selbst gestoppt, bevor seine Services woanders starten.</p>
+          </div>
+          <div class="card">
+            <h3>Tailscale</h3>
+            <label class="check"><input type="checkbox" v-model="settings.tailscale.enabled"> Tailscale auf allen Linux-Nodes aktivieren</label>
+            <label class="field" style="margin-top:8px">Auth-Key<input type="password" v-model="settings.tailscale.authkey" autocomplete="off" placeholder="tskey-auth-…"></label>
+            <p class="hint">Den Key in der Tailscale-Admin-Konsole anlegen: Settings → Keys → „Generate auth key“, dabei <b>Reusable</b> aktivieren.
+              DSN startet damit auf jedem Linux-Node einen Tailscale-Container. Neue Nodes bekommen den Key automatisch.
+              Windows-PCs nutzen die normale Tailscale-App.</p>
+            <label class="check"><input type="checkbox" v-model="settings.tailscale.use_for_cluster"> Cluster-Verkehr (Heartbeats, Sync) über Tailscale</label>
+            <label class="check" style="margin-top:6px"><input type="checkbox" v-model="settings.tailscale.serve_dashboard"> Dashboard per HTTPS im Tailnet (https://&lt;node&gt;.&lt;tailnet&gt;.ts.net)</label>
+            <p class="hint">Für HTTPS müssen in der Tailscale-Konsole unter DNS „MagicDNS“ und „HTTPS Certificates“ aktiviert sein.</p>
+          </div>
+          <div class="card">
+            <h3>Cloudflare DNS</h3>
+            <div class="form-grid">
+              <label class="field">API-Token<input type="password" v-model="settings.dns.api_token" autocomplete="off" placeholder="Zone.DNS:Edit + Zone:Read"></label>
+              <label class="field">TTL (Sekunden)<input type="number" v-model.number="settings.dns.ttl"></label>
+            </div>
+            <p class="hint">Bei Failover setzt der Leader die A-Records des Services auf die öffentliche IP des neuen Nodes. Kurze TTL (60 s) = schnelle Umschaltung.</p>
+            <h3 style="margin-top:18px">Alarm-Schwellen</h3>
+            <div class="form-grid">
+              <label class="field">Disk ab %<input type="number" v-model.number="settings.thresholds.disk"></label>
+              <label class="field">RAM ab %<input type="number" v-model.number="settings.thresholds.mem"></label>
+              <label class="field">Latenz ab ms<input type="number" v-model.number="settings.thresholds.rtt_ms"></label>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Benachrichtigungen</h3>
+            <div class="form-grid">
+              <label class="field">ntfy Server-URL<input type="text" v-model="settings.alerts.ntfy.url" placeholder="https://ntfy.sh"></label>
+              <label class="field">ntfy Topic<input type="text" v-model="settings.alerts.ntfy.topic"></label>
+              <label class="field">ntfy Token (optional)<input type="password" v-model="settings.alerts.ntfy.token" autocomplete="off"></label>
+            </div>
+            <div class="form-grid" style="margin-top:12px">
+              <label class="field">Gotify URL<input type="text" v-model="settings.alerts.gotify.url" placeholder="https://gotify.example.com"></label>
+              <label class="field">Gotify App-Token<input type="password" v-model="settings.alerts.gotify.token" autocomplete="off"></label>
+            </div>
+            <h3 style="margin-top:18px">Discord / Slack Webhooks</h3>
+            <div v-for="(wh, i) in settings.alerts.webhooks" :key="i" style="display:flex; gap:8px; margin-bottom:8px">
+              <select v-model="wh.type" style="width:120px"><option value="discord">Discord</option><option value="slack">Slack</option></select>
+              <input type="text" v-model="wh.url" placeholder="https://discord.com/api/webhooks/…">
+              <button class="btn sm danger" @click="settings.alerts.webhooks.splice(i, 1)">✕</button>
+            </div>
+            <button class="btn sm" @click="settings.alerts.webhooks.push({type: 'discord', url: ''})">+ Webhook</button>
+          </div>
+          <div class="card">
+            <h3>E-Mail (SMTP)</h3>
+            <div class="form-grid">
+              <label class="field">SMTP-Server<input type="text" v-model="settings.alerts.email.host"></label>
+              <label class="field">Port<input type="number" v-model.number="settings.alerts.email.port"></label>
+              <label class="field">Benutzer<input type="text" v-model="settings.alerts.email.username" autocomplete="off"></label>
+              <label class="field">Passwort<input type="password" v-model="settings.alerts.email.password" autocomplete="off"></label>
+              <label class="field">Absender<input type="text" v-model="settings.alerts.email.sender"></label>
+              <label class="field">Empfänger (Komma-getrennt)<input type="text" v-model="settings.alerts.email.recipients"></label>
+            </div>
+            <label class="check" style="margin-top:10px"><input type="checkbox" v-model="settings.alerts.email.starttls"> STARTTLS (bei Port 465 wird automatisch SSL genutzt)</label>
+            <div style="margin-top:14px"><button class="btn" @click="testAlert" :disabled="busy">Testalarm senden</button>
+              <span class="sub"> Erst speichern, dann testen.</span></div>
+          </div>
+        </div>
+
+        <div class="section-head"><h2>Benutzer</h2><div class="spacer"></div><button class="btn" @click="userForm = {username: '', password: '', role: 'viewer', isNew: true}">+ Benutzer</button></div>
+        <div class="card table-wrap">
+          <table>
+            <thead><tr><th>Benutzer</th><th>Rolle</th><th>2FA</th><th></th></tr></thead>
+            <tbody><tr v-for="u in users" :key="u.username">
+              <td><b>{{ u.username }}</b></td><td>{{ u.role === 'admin' ? 'Admin' : 'Nur lesen' }}</td>
+              <td><span class="pill" :class="u.totp ? 'good' : 'warning'"><span class="dot"></span>{{ u.totp ? 'aktiv' : 'aus' }}</span></td>
+              <td><div class="actions">
+                <button class="btn sm" @click="userForm = {username: u.username, password: '', role: u.role, isNew: false}">Bearbeiten</button>
+                <button class="btn sm" v-if="u.totp" @click="resetTotp(u.username)">2FA zurücksetzen</button>
+                <button class="btn sm danger" @click="deleteUser(u.username)">Löschen</button>
+              </div></td>
+            </tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============================================= Konto -->
+      <section v-if="tab === 'account'">
+        <div class="section-head"><h2>Mein Konto</h2></div>
+        <div class="grid two-col">
+          <div class="card">
+            <h3>Zwei-Faktor-Authentifizierung</h3>
+            <p v-if="me.totp"><span class="pill good"><span class="dot"></span>Aktiv</span> Dein Konto ist mit TOTP geschützt.</p>
+            <template v-else>
+              <p class="sub">Mit einer Authenticator-App (Aegis, 2FAS, Google Authenticator, Bitwarden …) einrichten.</p>
+              <button class="btn primary" v-if="!totp.uri" @click="beginTotp">2FA einrichten</button>
+              <div v-else>
+                <div v-html="totp.qr" style="background:#fff; display:inline-block; padding:8px; border-radius:8px"></div>
+                <p class="hint">Oder manuell: <code>{{ totp.secret }}</code></p>
+                <div style="display:flex; gap:8px; max-width:320px">
+                  <input type="text" v-model="totp.code" placeholder="6-stelliger Code" inputmode="numeric">
+                  <button class="btn primary" @click="enableTotp">Aktivieren</button>
+                </div>
+              </div>
+            </template>
+            <div class="error-box" v-if="totp.error">{{ totp.error }}</div>
+          </div>
+          <div class="card">
+            <h3>Passwort ändern</h3>
+            <div class="form-grid">
+              <label class="field">Aktuelles Passwort<input type="password" v-model="pw.old" autocomplete="current-password"></label>
+              <label class="field">Neues Passwort (min. 10 Zeichen)<input type="password" v-model="pw.new" autocomplete="new-password"></label>
+            </div>
+            <div style="margin-top:12px"><button class="btn primary" @click="changePassword">Ändern</button></div>
+            <div class="error-box" v-if="pw.error">{{ pw.error }}</div>
+            <div class="ok-box" v-if="pw.ok">{{ pw.ok }}</div>
+          </div>
+        </div>
+      </section>
+    </main>
+    <main v-else><div class="empty">Lade …</div></main>
+
+    <!-- ============================================= Modal: Service bearbeiten -->
+    <div class="overlay" v-if="svcForm" @mousedown.self="svcForm = null">
+      <div class="modal wide">
+        <div class="modal-head"><h2>{{ svcForm.isNew ? 'Neuer Service' : 'Service ' + svcForm.name }}</h2><button class="btn sm" @click="svcForm = null">✕</button></div>
+        <div class="form-grid">
+          <label class="field">Name (a-z, 0-9, -)<input type="text" v-model="svcForm.name" :disabled="!svcForm.isNew" placeholder="nextcloud"></label>
+          <label class="field">Beschreibung<input type="text" v-model="svcForm.description"></label>
+          <label class="field">Failback<select v-model="svcForm.failback">
+            <option value="global">Globale Einstellung</option><option value="on">Immer automatisch</option><option value="off">Nie automatisch</option></select></label>
+        </div>
+        <label class="check" style="margin:10px 0"><input type="checkbox" v-model="svcForm.enabled"> Aktiv (deaktivierte Services werden überall gestoppt)</label>
+        <div class="grid two-col">
+          <div>
+            <label class="field">docker-compose.yml
+              <textarea v-model="svcForm.compose" rows="20" spellcheck="false"></textarea></label>
+            <p class="hint">Persistente Daten bitte unter <code>${DSN_DATA}</code> ablegen. Nur dieses Verzeichnis wird zwischen den Nodes synchronisiert.
+              Keine <code>container_name</code> verwenden, denn DSN benennt die Container selbst.</p>
+            <label class="field" style="margin-top:10px">Umgebungsvariablen (KEY=wert, eine pro Zeile)
+              <textarea v-model="svcForm.envText" rows="4" spellcheck="false"></textarea></label>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:16px">
+            <div>
+              <h3>Platzierung</h3>
+              <p class="hint" style="margin-top:0">Reihenfolge = Priorität. Der erste verfügbare Node gewinnt.</p>
+              <div v-for="(n, i) in svcForm.preferred" :key="n" style="display:flex; align-items:center; gap:6px; margin-bottom:4px">
+                <span class="badge">{{ i + 1 }}</span><b style="flex:1">{{ n }}</b>
+                <button class="btn sm" @click="movePref(i, -1)" :disabled="i === 0">↑</button>
+                <button class="btn sm" @click="movePref(i, 1)" :disabled="i === svcForm.preferred.length - 1">↓</button>
+                <button class="btn sm danger" @click="svcForm.preferred.splice(i, 1)">✕</button>
+              </div>
+              <div class="chips" style="margin-top:6px">
+                <button class="btn sm" v-for="n in workerNodes.filter(x => !svcForm.preferred.includes(x.name))" :key="n.name" @click="svcForm.preferred.push(n.name)">+ {{ n.name }}</button>
+              </div>
+              <label class="check" style="margin-top:10px"><input type="checkbox" v-model="svcForm.auto"> Wenn kein bevorzugter Node verfügbar: automatisch nach freien Ressourcen wählen</label>
+              <label class="field" style="margin-top:10px">Constraints (label=wert, eine pro Zeile)
+                <textarea v-model="svcForm.constraintsText" rows="2" placeholder="storage=raid" spellcheck="false"></textarea></label>
+            </div>
+            <div>
+              <h3>Datensync</h3>
+              <div class="form-grid">
+                <label class="field">Modus<select v-model="svcForm.sync.mode">
+                  <option value="none">Kein Sync (stateless)</option>
+                  <option value="periodic">Periodisch (rsync)</option>
+                  <option value="dump">DB-Dump + rsync</option></select></label>
+                <label class="field" v-if="svcForm.sync.mode !== 'none'">Intervall (Sekunden)<input type="number" v-model.number="svcForm.sync.interval" min="30"></label>
+              </div>
+              <template v-if="svcForm.sync.mode === 'dump'">
+                <div class="form-grid" style="margin-top:8px">
+                  <label class="field">Compose-Service für Dump<input type="text" v-model="svcForm.sync.dump_service" placeholder="db"></label>
+                </div>
+                <label class="field" style="margin-top:8px">Dump-Befehl (im Container)
+                  <input type="text" v-model="svcForm.sync.dump_command" placeholder="pg_dump -U app app > /backup/dump.sql"></label>
+                <p class="hint">Das Zielverzeichnis des Dumps muss unter <code>${DSN_DATA}</code> gemountet sein.</p>
+              </template>
+              <p class="hint" v-if="svcForm.sync.mode !== 'none'">Der aktive Node pusht <code>${DSN_DATA}</code> regelmäßig zu allen anderen passenden Nodes.
+                Bei geplanten Umzügen (Failback, Drain, manuell) wird der Stack vorher gestoppt und final synchronisiert, also ohne Datenverlust.
+                Bei einem echten Ausfall gilt der Stand des letzten Syncs.</p>
+            </div>
+            <div>
+              <h3>DNS-Records (Cloudflare)</h3>
+              <label class="field">Ein Hostname pro Zeile, optional „proxied“ dahinter
+                <textarea v-model="svcForm.dnsText" rows="3" placeholder="cloud.example.com&#10;app.example.com proxied" spellcheck="false"></textarea></label>
+            </div>
+          </div>
+        </div>
+        <div class="error-box" v-if="svcForm.error">{{ svcForm.error }}</div>
+        <div class="modal-foot">
+          <button class="btn danger" v-if="!svcForm.isNew" @click="deleteService(svcForm.name)">Service löschen</button>
+          <button class="btn" v-if="svcForm.adopted" @click="restoreOriginal(svcForm.name)"
+                  :title="'Original auf ' + svcForm.adopted.node + ' wieder starten'">Original wiederherstellen</button>
+          <span style="flex:1"></span>
+          <button class="btn" @click="svcForm = null">Abbrechen</button>
+          <button class="btn primary" @click="saveService" :disabled="busy">Speichern</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: In HA aufnehmen -->
+    <div class="overlay" v-if="adopt" @mousedown.self="!adopt.busy && (adopt = null)">
+      <div class="modal wide">
+        <div class="modal-head"><h2>In HA aufnehmen: {{ adopt.ref }} <span class="sub">auf {{ adopt.node }}</span></h2>
+          <button class="btn sm" @click="adopt = null" :disabled="adopt.busy">✕</button></div>
+        <div v-if="!adopt.plan && !adopt.error" class="empty">Analysiere Container …</div>
+        <template v-if="adopt.plan">
+          <ol class="sub" style="margin-top:0; padding-left:18px">
+            <li>Original stoppen. Es bleibt erhalten und lässt sich jederzeit wiederherstellen.</li>
+            <li>Ausgewählte Daten nach <code>/srv/dsn/volumes/{{ adopt.name || '…' }}/</code> <b>kopieren</b>. Die Originaldaten bleiben unverändert.</li>
+            <li>Als DSN-Service auf {{ adopt.node }} starten. Ab dann gilt: Failover, Sync, Monitoring.</li>
+          </ol>
+          <div class="form-grid">
+            <label class="field">Service-Name in DSN<input type="text" v-model="adopt.name"></label>
+            <label class="field">Datensync<select v-model="adopt.sync.mode">
+              <option value="none">Kein Sync</option><option value="periodic">Periodisch (rsync)</option><option value="dump">DB-Dump + rsync</option></select></label>
+            <label class="field" v-if="adopt.sync.mode !== 'none'">Intervall (Sekunden)<input type="number" v-model.number="adopt.sync.interval" min="30"></label>
+          </div>
+          <div class="form-grid" v-if="adopt.sync.mode === 'dump'" style="margin-top:8px">
+            <label class="field">Compose-Service für Dump<input type="text" v-model="adopt.sync.dump_service" placeholder="db"></label>
+            <label class="field">Dump-Befehl<input type="text" v-model="adopt.sync.dump_command" placeholder="pg_dump -U app app > /backup/dump.sql"></label>
+          </div>
+          <p class="hint">Quelle des Compose-Files: <b>{{ {portainer: 'aus Portainer gelesen', compose: 'Compose-Datei vom Server gelesen', generated: 'aus den laufenden Containern erzeugt'}[adopt.plan.source] }}</b></p>
+          <div v-if="adopt.plan.warnings.length" class="card" style="border-color: var(--warning); margin: 10px 0">
+            <b>Bitte prüfen:</b>
+            <ul style="margin:6px 0 0; padding-left:18px"><li v-for="w in adopt.plan.warnings" :key="w" class="sub">{{ w }}</li></ul>
+          </div>
+          <h3 style="margin-top:14px">Daten (Volumes und Bind-Mounts)</h3>
+          <div class="table-wrap" v-if="adopt.plan.mounts.length">
+            <table>
+              <thead><tr><th>Übernehmen</th><th>Service</th><th>Pfad im Container</th><th>Quelle auf dem Host</th><th>Neu</th></tr></thead>
+              <tbody><tr v-for="m in adopt.plan.mounts" :key="m.key">
+                <td><input type="checkbox" :checked="m.migrate" :disabled="!m.source" @change="toggleMount(m, $event.target.checked)"></td>
+                <td>{{ m.service }}</td><td class="mono">{{ m.destination }}</td>
+                <td class="mono">{{ m.source || '–' }} <span class="sub">{{ m.type === 'volume' ? 'Docker-Volume' : m.is_dir ? 'Ordner' : 'Datei' }}</span></td>
+                <td class="mono">{{ m.migrate ? '${DSN_DATA}/' + m.key : 'unverändert' }}</td>
+              </tr></tbody>
+            </table>
+          </div>
+          <p v-else class="sub">Keine Volumes, der Container ist zustandslos.</p>
+          <p class="hint">Nur übernommene Daten werden auf die anderen Nodes synchronisiert. Systempfade wie <code>docker.sock</code> oder <code>/etc/localtime</code> sind absichtlich abgewählt.</p>
+          <h3 style="margin-top:14px">Ausweich-Nodes bei Ausfall</h3>
+          <div class="chips">
+            <label class="check" v-for="n in workerNodes.filter(x => x.name !== adopt.node)" :key="n.name">
+              <input type="checkbox" :value="n.name" v-model="adopt.preferred"> {{ n.name }}</label>
+          </div>
+          <details style="margin-top:14px">
+            <summary class="sub" style="cursor:pointer">Generiertes Compose-File anzeigen/bearbeiten</summary>
+            <textarea v-model="adopt.compose" rows="18" spellcheck="false" style="margin-top:8px"></textarea>
+            <p class="hint">Achtung: Ein Klick auf eine Daten-Checkbox erzeugt das Compose neu, manuelle Änderungen gehen dann verloren.</p>
+          </details>
+        </template>
+        <div class="error-box" v-if="adopt.error">{{ adopt.error }}</div>
+        <div class="modal-foot">
+          <button class="btn" @click="adopt = null" :disabled="adopt.busy">Abbrechen</button>
+          <button class="btn primary" v-if="adopt.plan" @click="confirmAdopt" :disabled="adopt.busy || !adopt.name">
+            {{ adopt.busy ? 'Übernehme … (Daten werden kopiert)' : 'Jetzt in HA aufnehmen' }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Konsole -->
+    <div class="overlay" v-if="consoleBox" style="padding-top:20px">
+      <div class="modal wide" style="max-width:1200px">
+        <div class="modal-head"><h2>Konsole: {{ consoleBox.name }} <span class="sub">auf {{ consoleBox.node }}</span></h2>
+          <span class="sub" style="margin-right:10px">{{ consoleBox.status }}</span>
+          <button class="btn sm" @click="closeConsole">Schließen</button></div>
+        <div id="term" style="height:65vh; background:#0d0d0d; border-radius:8px; padding:6px"></div>
+        <p class="hint">Shell im Container (bash, sonst sh). Mit <code>exit</code> oder „Schließen“ beenden. Alles wird im Ereignis-Log protokolliert.</p>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Container-Details -->
+    <div class="overlay" v-if="inspectBox" @mousedown.self="inspectBox = null">
+      <div class="modal wide">
+        <div class="modal-head"><h2>Details: {{ inspectBox.name }}</h2><button class="btn sm" @click="inspectBox = null">✕</button></div>
+        <div v-if="inspectBox.data" class="grid two-col" style="margin-bottom:12px">
+          <div class="card"><h3>Allgemein</h3>
+            <div class="sub">Image: <span class="mono">{{ inspectBox.data.Config.Image }}</span></div>
+            <div class="sub">Status: {{ inspectBox.data.State.Status }} seit {{ new Date(inspectBox.data.State.StartedAt).toLocaleString('de-DE') }}</div>
+            <div class="sub">Neustart-Regel: {{ inspectBox.data.HostConfig.RestartPolicy.Name || 'no' }}</div>
+            <div class="sub">Netzwerke: {{ Object.keys(inspectBox.data.NetworkSettings.Networks || {}).join(', ') }}</div>
+          </div>
+          <div class="card"><h3>Mounts</h3>
+            <div v-for="m in inspectBox.data.Mounts" :key="m.Destination" class="sub mono">{{ m.Source || m.Name }} → {{ m.Destination }}</div>
+            <div v-if="!inspectBox.data.Mounts.length" class="sub">keine</div>
+          </div>
+        </div>
+        <details><summary class="sub" style="cursor:pointer">Vollständiges docker inspect (JSON)</summary>
+          <pre class="logs" style="margin-top:8px">{{ JSON.stringify(inspectBox.data, null, 2) }}</pre></details>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Stack anlegen/bearbeiten -->
+    <div class="overlay" v-if="stackForm" @mousedown.self="!stackForm.busy && (stackForm = null)">
+      <div class="modal wide">
+        <div class="modal-head"><h2>{{ stackForm.isNew ? 'Neuer Stack' : 'Stack ' + stackForm.name }} <span class="sub">auf {{ stackForm.node }}</span></h2>
+          <button class="btn sm" @click="stackForm = null">✕</button></div>
+        <div class="form-grid">
+          <label class="field">Name<input type="text" v-model="stackForm.name" :disabled="!stackForm.isNew" placeholder="mein-stack"></label>
+          <label class="field" v-if="stackForm.isNew">Hochverfügbarkeit<select v-model="stackForm.ha">
+            <option :value="false">Nein: nur auf {{ stackForm.node }} (wie Portainer)</option>
+            <option :value="true">Ja: als HA-Service (Failover, Sync)</option></select></label>
+        </div>
+        <p class="hint" v-if="stackForm.ha">Wird als HA-Service angelegt, bevorzugt auf {{ stackForm.node }}. Daten bitte unter <code>${DSN_DATA}</code> ablegen. Details wie Sync und DNS kannst du danach unter Services einstellen.</p>
+        <label class="field" style="margin-top:10px">docker-compose.yml<textarea v-model="stackForm.compose" rows="18" spellcheck="false"></textarea></label>
+        <label class="field" style="margin-top:10px">Umgebungsvariablen (.env, KEY=wert)<textarea v-model="stackForm.env" rows="4" spellcheck="false"></textarea></label>
+        <div class="error-box" v-if="stackForm.error">{{ stackForm.error }}</div>
+        <div class="modal-foot"><button class="btn" @click="stackForm = null">Abbrechen</button>
+          <button class="btn primary" @click="saveStack" :disabled="stackForm.busy || !stackForm.name">{{ stackForm.busy ? 'Deploye …' : 'Deployen' }}</button></div>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Ganzen Server schützen -->
+    <div class="overlay" v-if="bulk" @mousedown.self="!bulk.running && (bulk = null)">
+      <div class="modal wide">
+        <div class="modal-head"><h2>Ganzen Server schützen: {{ bulk.node }}</h2><button class="btn sm" @click="bulk = null" :disabled="bulk.running">✕</button></div>
+        <p class="sub" style="margin-top:0">Alle markierten Stacks und Container werden nacheinander ins HA übernommen, jeweils mit der Vorauswahl des Assistenten:
+          Original stoppen, Daten kopieren, als DSN-Service starten. Danach ist der Server als <b>vollständig geschützt</b> markiert,
+          und neue Container, die außerhalb von DSN gestartet werden, lösen eine Warnung aus.</p>
+        <div v-if="bulk.loading" class="empty">Analysiere {{ bulk.items.length }} Einträge …</div>
+        <div class="table-wrap" v-else>
+          <table>
+            <thead><tr><th></th><th>Stack / Container</th><th>Service-Name</th><th>Daten</th><th>Sync</th><th>Hinweise</th><th>Status</th></tr></thead>
+            <tbody><tr v-for="it in bulk.items" :key="it.ref">
+              <td><input type="checkbox" v-model="it.include" :disabled="bulk.running || !it.plan"></td>
+              <td><b>{{ it.ref }}</b><span class="sub">{{ it.kind === 'stack' ? 'Stack' : 'Container' }}</span></td>
+              <td><input type="text" v-model="it.name" :disabled="bulk.running" style="max-width:180px"></td>
+              <td class="sub">{{ it.plan ? it.plan.mounts.filter(m => m.migrate).length + ' Quelle(n)' : '–' }}</td>
+              <td><select v-model="it.syncMode" :disabled="bulk.running" style="width:auto">
+                <option value="none">kein</option><option value="periodic">rsync</option></select></td>
+              <td class="sub"><span v-if="it.error" style="color:var(--critical)">{{ it.error }}</span>
+                <span v-else-if="it.plan && it.plan.warnings.length" :title="it.plan.warnings.join('\n')">⚠️ {{ it.plan.warnings.length }} (Mauszeiger)</span></td>
+              <td><span class="pill" :class="{done: 'good', failed: 'critical', running: 'info'}[it.state] || ''"><span class="dot"></span>{{ {done: 'übernommen', failed: 'Fehler', running: 'läuft …', pending: 'bereit'}[it.state] }}</span></td>
+            </tr></tbody>
+          </table>
+        </div>
+        <p class="hint">Einzelne Einträge prüfst du genauer mit „In HA aufnehmen“ in der Docker-Ansicht. Images, die lokal gebaut wurden („build“), müssen vorher in eine Registry.</p>
+        <div class="modal-foot">
+          <button class="btn" @click="bulk = null" :disabled="bulk.running">Schließen</button>
+          <button class="btn primary" @click="runBulk" :disabled="bulk.running || bulk.loading || !bulk.items.some(i => i.include)">
+            {{ bulk.running ? 'Übernehme …' : bulk.items.filter(i => i.include).length + ' Einträge jetzt schützen' }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Logs -->
+    <div class="overlay" v-if="logs" @mousedown.self="logs = null">
+      <div class="modal wide">
+        <div class="modal-head"><h2>Logs: {{ logs.name }}</h2>
+          <label class="check" style="margin-right:10px"><input type="checkbox" v-model="logs.follow"> Live</label>
+          <button class="btn sm" @click="logs.reload()">Aktualisieren</button>&nbsp;<button class="btn sm" @click="logs = null">✕</button></div>
+        <pre class="logs">{{ logs.text }}</pre>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Node-Verlauf -->
+    <div class="overlay" v-if="nodeDetail" @mousedown.self="nodeDetail = null">
+      <div class="modal wide">
+        <div class="modal-head"><h2>{{ nodeDetail.name }}: Verlauf (letzte 6 h)</h2><button class="btn sm" @click="nodeDetail = null">✕</button></div>
+        <div v-if="!nodeDetail.history.length" class="empty">Noch keine Daten gesammelt.</div>
+        <div v-else class="grid two-col">
+          <div class="card"><h3>CPU &amp; RAM</h3>
+            <line-chart :series="nodeDetail.cpuMem" unit="%" :max="100"></line-chart></div>
+          <div class="card"><h3>Latenz zu {{ nodeDetail.name }}</h3>
+            <line-chart :series="nodeDetail.rtt" unit="ms"></line-chart></div>
+          <div class="card"><h3>Netzwerk</h3>
+            <line-chart :series="nodeDetail.net" unit="B/s" :fmt="bytes"></line-chart></div>
+          <div class="card"><h3>Disks</h3>
+            <div v-for="d in (nodeById(nodeDetail.name)?.metrics.disks || [])" :key="d.name" class="meter" style="grid-template-columns: 110px 1fr 52px; margin-bottom:6px">
+              <span class="lbl">{{ d.name }}</span><div class="track"><div class="fill" :class="level(d.percent || 0, 90, 80)" :style="{width: (d.percent || 0) + '%'}"></div></div><span class="val">{{ d.error ? '–' : d.percent.toFixed(0) + ' %' }}</span>
+            </div>
+            <div class="checks" style="margin-top:12px">
+              <div v-for="c in (nodeById(nodeDetail.name)?.metrics.hostchecks || [])" :key="c.name">
+                <span class="pill" :class="c.status === 'ok' ? 'good' : c.status === 'critical' ? 'critical' : 'warning'"><span class="dot"></span>{{ c.name }}</span>
+                <span class="sub"> {{ c.summary }}</span>
+                <ul class="sub" v-if="c.details && c.details.length" style="margin:4px 0 0 0; padding-left:18px"><li v-for="(x, i) in c.details" :key="i">{{ x }}</li></ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Server hinzufügen -->
+    <div class="overlay" v-if="join" @mousedown.self="join = null">
+      <div class="modal">
+        <div class="modal-head"><h2>Server hinzufügen</h2><button class="btn sm" @click="join = null">✕</button></div>
+        <div class="tabs" style="margin-bottom:12px">
+          <button :class="{active: join.os === 'token'}" @click="join.os = 'token'">🔑 Per Token (empfohlen)</button>
+          <button :class="{active: join.os === 'linux'}" @click="join.os = 'linux'; copied = false">🐧 Linux-Befehl</button>
+          <button :class="{active: join.os === 'windows'}" @click="join.os = 'windows'; copied = false">🪟 Windows-Befehl</button>
+        </div>
+        <template v-if="join.os === 'token'">
+          <ol style="padding-left:18px; margin-top:0" class="sub">
+            <li>Auf dem neuen Server DSN starten. Linux: <code>docker compose up -d</code> im DSN-Ordner.
+              Windows: <code>docker compose -f docker-compose.windows.yml up -d</code>.</li>
+            <li>Token anzeigen: <code>docker logs dsn</code> (beginnt mit <code>dsn1_</code>)</li>
+            <li>Hier einfügen und auf „Server suchen“ klicken.</li>
+          </ol>
+          <label class="field">Pairing-Token<textarea v-model="join.token" rows="3" spellcheck="false" placeholder="dsn1_…"></textarea></label>
+          <label class="field" style="margin-top:8px">Adresse des Servers (optional – sonst die Adressen aus dem Token)
+            <input type="text" v-model="join.address" placeholder="z.B. 192.168.1.20 oder 100.x.y.z (Tailscale)"></label>
+          <div style="margin-top:10px"><button class="btn primary" @click="pairCheck" :disabled="!join.token || join.busy">{{ join.busy && !join.found ? 'Suche …' : 'Server suchen' }}</button></div>
+          <div class="error-box" v-if="join.error">{{ join.error }}</div>
+          <div v-if="join.tried && join.tried.length && !join.found" class="sub" style="margin-top:8px">
+            Nicht erreichbar: <span v-for="t in join.tried" :key="t.address" class="mono"><br>{{ t.address }}: {{ t.error }}</span>
+            <br>Liegt der Server in einem anderen Netz? Dann seine erreichbare IP (z.B. Tailscale oder öffentliche IP mit offenem Port 7946) oben eintragen.
+          </div>
+          <div v-if="join.found" class="card" style="margin-top:12px">
+            <h3>Gefunden: {{ join.found.info.hostname }} <span class="badge">{{ join.found.platform === 'windows' ? 'Windows' : 'Linux' }}</span></h3>
+            <div class="sub">{{ join.found.info.os }} · {{ join.found.info.cpus }} CPUs · {{ bytes(join.found.info.mem_total) }} RAM ·
+              Docker {{ join.found.info.docker.version }} · {{ join.found.info.docker.containers }} Container ({{ join.found.info.docker.running }} laufen)</div>
+            <div class="sub">Erreichbar unter <span class="mono">{{ join.found.address }}</span></div>
+            <div class="form-grid" style="margin-top:12px">
+              <label class="field">Name im Cluster<input type="text" v-model="join.form.name"></label>
+              <label class="field">Rolle<select v-model="join.form.role"><option value="worker">Worker (führt Services aus)</option><option value="witness">Witness (nur Quorum-Stimme)</option></select></label>
+              <label class="field">Öffentliche IP (für DNS-Failover)<input type="text" v-model="join.form.public_ip" placeholder="optional"></label>
+              <label class="field">Leader-Priorität<input type="number" v-model.number="join.form.leader_priority"></label>
+            </div>
+            <label class="field" style="margin-top:10px">Labels (key=wert, eine pro Zeile)<textarea v-model="join.form.labels" rows="2" placeholder="location=home"></textarea></label>
+            <div class="modal-foot"><button class="btn primary" @click="pairComplete" :disabled="join.busy || !join.form.name">{{ join.busy ? 'Nehme auf …' : 'In den Cluster aufnehmen' }}</button></div>
+          </div>
+          <p class="hint">Der Token gilt nur einmal. Er wird aus Sicherheitsgründen nur im Server-Log angezeigt, denn wer ihn hat, kann den Server in einen Cluster holen.</p>
+        </template>
+        <template v-else-if="join.os === 'linux'">
+          <ol style="padding-left:18px; margin-top:0">
+            <li>Den neuen Server ins <b>WireGuard/Tailscale-Netz</b> bzw. LAN bringen und prüfen, dass er <code>{{ join.seed }}</code> erreicht.</li>
+            <li>Docker installieren, falls noch nicht vorhanden (das Skript bietet es an).</li>
+            <li>Auf dem neuen Server ausführen. Platzhalter ersetzen:</li>
+          </ol>
+          <pre class="cmd">{{ join.command }}</pre>
+          <button class="btn sm" @click="copy(join.command)">{{ copied ? 'Kopiert ✓' : 'Kopieren' }}</button>
+          <p class="hint">Weitere Optionen: <code>--role witness</code> (nur Quorum-Stimme, keine Container) · <code>--label storage=raid</code> (mehrfach möglich) ·
+            <code>--disk "RAID600:/srv/raid600"</code> (Disk-Überwachung) · <code>--priority 50</code> (bevorzugter Leader).</p>
+        </template>
+        <template v-else>
+          <ol style="padding-left:18px; margin-top:0">
+            <li><b>Docker Desktop</b> installieren und starten (Linux-Container-Modus, Standard).</li>
+            <li>Prüfen, dass der PC <code>{{ join.seed }}</code> erreicht (gleiches LAN oder Tailscale).</li>
+            <li><b>PowerShell als Administrator</b> öffnen (für die Firewall-Regel) und ausführen. Platzhalter ersetzen:</li>
+          </ol>
+          <pre class="cmd">{{ join.command_windows }}</pre>
+          <button class="btn sm" @click="copy(join.command_windows)">{{ copied ? 'Kopiert ✓' : 'Kopieren' }}</button>
+          <p class="hint"><code>-Address</code> ist die IP, unter der die anderen Nodes diesen PC erreichen (z.B. LAN- oder Tailscale-IP).
+            Weitere Optionen: <code>-Role witness</code> · <code>-Label location=buero</code> · <code>-Priority 50</code>.
+            Hinweis: Ein Windows-PC eignet sich vor allem als Witness oder Ausweich-Node, denn Windows-Updates und Neustarts lösen Failover aus.</p>
+        </template>
+        <p class="hint">⚠️ Der Befehl enthält das Cluster-Secret. Nur über sichere Kanäle weitergeben.</p>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Node bearbeiten -->
+    <div class="overlay" v-if="nodeForm" @mousedown.self="nodeForm = null">
+      <div class="modal" style="max-width:520px">
+        <div class="modal-head"><h2>{{ nodeForm.name }} bearbeiten</h2><button class="btn sm" @click="nodeForm = null">✕</button></div>
+        <label class="field">Öffentliche IP (für DNS-Failover)<input type="text" v-model="nodeForm.public_ip"></label>
+        <label class="field" style="margin-top:10px">Leader-Priorität (kleiner = bevorzugt)<input type="number" v-model.number="nodeForm.leader_priority"></label>
+        <label class="field" style="margin-top:10px">Labels (key=wert, eine pro Zeile)<textarea v-model="nodeForm.labelsText" rows="4"></textarea></label>
+        <p class="hint">Hinweis: Ändert sich die IP in /etc/dsn/config.yml, überschreibt der Node den Wert beim nächsten Start nicht. Hier gepflegte Werte gelten.</p>
+        <div class="error-box" v-if="nodeForm.error">{{ nodeForm.error }}</div>
+        <div class="modal-foot"><button class="btn" @click="nodeForm = null">Abbrechen</button><button class="btn primary" @click="saveNode">Speichern</button></div>
+      </div>
+    </div>
+
+    <!-- ============================================= Modal: Benutzer -->
+    <div class="overlay" v-if="userForm" @mousedown.self="userForm = null">
+      <div class="modal" style="max-width:460px">
+        <div class="modal-head"><h2>{{ userForm.isNew ? 'Neuer Benutzer' : userForm.username }}</h2><button class="btn sm" @click="userForm = null">✕</button></div>
+        <label class="field" v-if="userForm.isNew">Benutzername<input type="text" v-model="userForm.username"></label>
+        <label class="field" style="margin-top:10px">{{ userForm.isNew ? 'Passwort' : 'Neues Passwort (leer = unverändert)' }}<input type="password" v-model="userForm.password" autocomplete="new-password"></label>
+        <label class="field" style="margin-top:10px">Rolle<select v-model="userForm.role"><option value="admin">Admin</option><option value="viewer">Nur lesen</option></select></label>
+        <div class="error-box" v-if="userForm.error">{{ userForm.error }}</div>
+        <div class="modal-foot"><button class="btn" @click="userForm = null">Abbrechen</button><button class="btn primary" @click="saveUser">Speichern</button></div>
+      </div>
+    </div>
+
+    <div class="overlay" v-if="toast" @mousedown.self="toast = null" style="align-items:flex-end; background:transparent; pointer-events:none">
+      <div class="card" :class="toast.error ? 'error-box' : 'ok-box'" style="pointer-events:auto; max-width:600px">{{ toast.text }}</div>
+    </div>
+  </template>
+  <div v-else class="empty" style="padding-top:30vh">Verbinde …</div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

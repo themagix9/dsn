@@ -1,0 +1,44 @@
+# DSN-Labor: drei virtuelle Server auf Docker Desktop.
+# Auf jedem läuft ein eigener Docker-Daemon, DSN wird mit dem echten install.sh installiert.
+#   voyager01  172.31.0.11  -> Dashboard http://localhost:18941
+#   pioneer01  172.31.0.12  -> Dashboard http://localhost:18942
+#   server3    172.31.0.13  -> leer, zum Üben von "Server hinzufügen" (Dashboard danach auf :18943)
+name: dsn-lab
+
+x-server: &server
+  build: .
+  image: dsn-lab-server
+  privileged: true
+  environment: { DOCKER_TLS_CERTDIR: "" }
+
+networks:
+  lab:
+    ipam: { config: [{ subnet: 172.31.0.0/24 }] }
+
+services:
+  voyager01:
+    <<: *server
+    container_name: lab-voyager01
+    hostname: voyager01
+    networks: { lab: { ipv4_address: 172.31.0.11 } }
+    ports: ["18941:7946"]
+    volumes: [voyager01-docker:/var/lib/docker]
+  pioneer01:
+    <<: *server
+    container_name: lab-pioneer01
+    hostname: pioneer01
+    networks: { lab: { ipv4_address: 172.31.0.12 } }
+    ports: ["18942:7946"]
+    volumes: [pioneer01-docker:/var/lib/docker]
+  server3:
+    <<: *server
+    container_name: lab-server3
+    hostname: server3
+    networks: { lab: { ipv4_address: 172.31.0.13 } }
+    ports: ["18943:7946", "18080:8080"]
+    volumes: [server3-docker:/var/lib/docker]
+
+volumes:
+  voyager01-docker: {}
+  pioneer01-docker: {}
+  server3-docker: {}

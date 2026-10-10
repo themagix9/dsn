@@ -1,0 +1,23 @@
+# DSN – Deep Space Network: Agent + Dashboard + Monitoring für einen Linux-Server.
+#
+# Schnellstart auf einem neuen Server (Docker muss installiert sein):
+#   docker compose up -d && docker logs dsn
+# -> DSN startet im Pairing-Modus und gibt einen Token aus. Den im Dashboard unter
+#    "Nodes -> Server hinzufügen" einfügen – fertig. (Erster Server? Siehe README "Neuen Cluster gründen".)
+services:
+  dsn:
+    image: ${DSN_IMAGE:-ghcr.io/themagix9/dsn:latest}
+    container_name: dsn
+    restart: unless-stopped
+    network_mode: host          # API/Dashboard (7946) + rsync (8873) direkt auf dem Host, auch für Tailscale
+    labels:
+      dsn.agent: "true"         # kennzeichnet den DSN-Agenten selbst (wird nie "in HA aufgenommen")
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/dsn:/etc/dsn:ro       # optional: klassische Konfiguration (install.sh)
+      - /var/lib/dsn:/var/lib/dsn  # Zustand + per Pairing erzeugte Konfiguration (gleicher Pfad wie auf dem Host)
+      - /srv/dsn:/srv/dsn          # Service-Daten (${DSN_DATA}), werden zwischen Nodes synchronisiert
+      - /:/host:ro                 # nur lesend: Disk-Metriken, Compose-Dateien bestehender Stacks
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

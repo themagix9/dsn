@@ -1,0 +1,25 @@
+# /etc/dsn/config.yml – lokale Konfiguration eines Nodes (wird von install.sh erzeugt)
+node:
+  name: voyager01            # eindeutig, a-z 0-9 -
+  address: 100.64.0.1        # Overlay-IP (WireGuard/Tailscale) – darüber läuft der gesamte Cluster-Traffic
+  public_ip: 203.0.113.10    # öffentliche IP für DNS-Failover (leer lassen bei Witness)
+  role: worker               # worker | witness (Witness = nur Quorum-Stimme, keine Container)
+  leader_priority: 10        # kleiner = wird bevorzugt Leader
+  labels:
+    location: berlin
+    storage: ssd
+
+cluster:
+  secret: "HIER-SECRET"      # identisch auf allen Nodes: python -m dsn gen-secret
+  seeds:                     # leer beim ersten Node, sonst mind. ein bestehender Node (Overlay-IP:Port)
+    - 100.64.0.2:7946
+
+port: 7946                   # API + Dashboard
+bind: 0.0.0.0                # z.B. auf die Overlay-IP setzen, um das Dashboard nur im VPN anzubieten
+rsync_port: 8873
+volumes_dir: /srv/dsn/volumes
+
+disks:                       # Überwachte Dateisysteme (Pfade auf dem Host)
+  - { name: SSD, path: / }
+  - { name: SAS-146, path: /srv/raid146 }
+  - { name: SAS-600, path: /srv/raid600 }
